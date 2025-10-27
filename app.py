@@ -1,5 +1,5 @@
 """
-app.py
+app.py - IMPROVED VERSION
 Face + finger gesture controlled appliance toggles prototype.
 Requires: face_recognition==1.4.0, mediapipe, opencv-python, numpy, imutils, pyserial
 """
@@ -22,17 +22,17 @@ KNOWN_FACES_DIR = "known_faces"
 TOLERANCE = 0.5
 FRAME_RESIZE_WIDTH = 640
 STABLE_FACE_FRAMES = 3
-STABLE_GESTURE_FRAMES = 6
-GESTURE_COOLDOWN_S = 1.5
+STABLE_GESTURE_FRAMES = 8  # Increased for more stability
+GESTURE_COOLDOWN_S = 2.0  # Increased cooldown
 SERIAL_BAUD_RATE = 9600
 SERIAL_TIMEOUT = 1
 
-# Finger count → appliance mapping
+# Finger count → appliance mapping (now with explicit ON/OFF)
 GESTURE_MAP = {
     1: "Light A",
     2: "Light B",
     3: "Fan",
-    5: "ALL_OFF"  # Special gesture to turn off everything
+    5: "ALL_OFF"  # Turn off everything
 }
 
 
@@ -52,13 +52,11 @@ def connect_serial(port=None):
     """Attempt to connect to Arduino via serial."""
     try:
         if port is None:
-            # Auto-detect Arduino
             ports = list_serial_ports()
             if not ports:
                 print("[SERIAL] No serial ports found.")
                 return None
             
-            # Try to find Arduino (usually has 'USB' or 'ACM' in name)
             arduino_port = None
             for p in ports:
                 if 'USB' in p.upper() or 'ACM' in p.upper() or 'COM' in p.upper():
@@ -66,12 +64,12 @@ def connect_serial(port=None):
                     break
             
             if arduino_port is None:
-                arduino_port = ports[0]  # Fallback to first port
+                arduino_port = ports[0]
             
             port = arduino_port
         
         ser = serial.Serial(port, SERIAL_BAUD_RATE, timeout=SERIAL_TIMEOUT)
-        time.sleep(2)  # Wait for Arduino to reset
+        time.sleep(2)
         print(f"[SERIAL] Connected to {port} at {SERIAL_BAUD_RATE} baud")
         return ser
         
@@ -107,24 +105,20 @@ def load_known_faces(known_dir):
         if ext.lower() not in (".jpg", ".jpeg", ".png"):
             continue
 
-        # Load and convert image properly
         img_bgr = cv2.imread(path)
         if img_bgr is None:
             print(f"[WARN] Could not read {fn}, skipping.")
             continue
         
-        # Convert BGR to RGB (face_recognition uses RGB)
         img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
         
         try:
-            # Detect faces first
             face_locations = face_recognition.face_locations(img_rgb, model="hog")
             
             if len(face_locations) == 0:
                 print(f"[WARN] No face found in {fn}, skipping.")
                 continue
             
-            # Encode the first face found
             encs = face_recognition.face_encodings(img_rgb, face_locations)
             
             if len(encs) == 0:
@@ -202,15 +196,18 @@ def main():
 
     last_action_time = defaultdict(lambda: 0.0)
     appliance_state = {name: False for name in GESTURE_MAP.values()}
+    
+    # NEW: Track last executed gesture to prevent re-triggering
+    last_executed_gesture = None
+    last_gesture_clear_time = time.time()
 
     mp_h = mp_hands.Hands(
         static_image_mode=False,
         max_num_hands=1,
-        min_detection_confidence=0.6,
-        min_tracking_confidence=0.5
+        min_detection_confidence=0.7,  # Increased for better detection
+        min_tracking_confidence=0.6
     )
 
-    # Initialize serial connection
     ser = connect_serial()
     
     print("[INFO] Webcam started. Press 'q' to quit, 'r' to reconnect serial.")
@@ -224,27 +221,22 @@ def main():
         frame = cv2.flip(frame, 1)
         frame_count += 1
         
-        # Resize frame
         scale = FRAME_RESIZE_WIDTH / frame.shape[1]
         small = cv2.resize(frame, (FRAME_RESIZE_WIDTH, int(frame.shape[0] * scale)))
         
-        # Convert to RGB for face_recognition (critical!)
         rgb_small = cv2.cvtColor(small, cv2.COLOR_BGR2RGB)
 
-        # Face detection & recognition (process every frame for better detection)
+        # Face detection & recognition
         recognized_name = None
         face_locations = []
         face_encodings = []
         
         try:
-            # Detect faces using HOG (faster) - returns list of (top, right, bottom, left)
             face_locations = face_recognition.face_locations(rgb_small, model="hog")
             
             if face_locations:
-                # Encode faces - MUST pass face_locations
                 face_encodings = face_recognition.face_encodings(rgb_small, face_locations)
                 
-                # Compare with known faces
                 for face_encoding in face_encodings:
                     matches = face_recognition.compare_faces(
                         known_encodings, 
@@ -260,7 +252,7 @@ def main():
                             break
                             
         except Exception as e:
-            if frame_count % 30 == 0:  # Log every 30 frames to avoid spam
+            if frame_count % 30 == 0:
                 print(f"[WARN] Face processing error: {e}")
 
         # Update face stability window
@@ -282,43 +274,56 @@ def main():
                 handedness_label = results.multi_handedness[0].classification[0].label
             finger_count = count_fingers_mediapipe(landmarks, handedness_label)
             mp_draw.draw_landmarks(small, landmarks, mp_hands.HAND_CONNECTIONS)
+            
+            # NEW: Update gesture window only when hand is detected
+            gesture_window.append(finger_count)
+            last_gesture_clear_time = time.time()
+        else:
+            # NEW: Clear gesture window if no hand detected for 0.5 seconds
+            if time.time() - last_gesture_clear_time > 0.5:
+                gesture_window.clear()
+                # Clear last executed gesture after hand is gone for a while
+                if time.time() - last_gesture_clear_time > 1.0:
+                    last_executed_gesture = None
 
-        # Update gesture stability window
-        gesture_window.append(finger_count)
+        # Determine stable gesture
         stable_gesture = None
         if len(gesture_window) == gesture_window.maxlen:
             vals = [v for v in gesture_window if v is not None]
-            if vals and all(v == vals[0] for v in vals):
-                stable_gesture = vals[0]
+            # Require ALL values to be the same for stability
+            if vals and len(vals) >= STABLE_GESTURE_FRAMES * 0.75:  # At least 75% agreement
+                if all(v == vals[0] for v in vals):
+                    stable_gesture = vals[0]
 
-        # Trigger appliance only if both face + gesture stable
+        # NEW: Only trigger if gesture is different from last executed gesture
         if stable_name and stable_gesture in GESTURE_MAP:
-            appliance = GESTURE_MAP[stable_gesture]
-            now = time.time()
-            
-            # Special case: 5 fingers turns off everything
-            if stable_gesture == 5:
-                if now - last_action_time["ALL_OFF"] > GESTURE_COOLDOWN_S:
-                    # Turn off all appliances
-                    for app_name in appliance_state.keys():
-                        appliance_state[app_name] = False
-                    print(f"[ACTION] {stable_name} turned OFF all appliances (5 fingers)")
-                    
-                    # Send to Arduino
-                    send_serial_data(ser, "5")
-                    
-                    last_action_time["ALL_OFF"] = now
-            else:
-                # Normal toggle for individual appliances
-                if now - last_action_time[appliance] > GESTURE_COOLDOWN_S:
-                    appliance_state[appliance] = not appliance_state[appliance]
-                    state_str = "ON" if appliance_state[appliance] else "OFF"
-                    print(f"[ACTION] {stable_name} triggered {appliance} -> {state_str} (fingers: {stable_gesture})")
-                    
-                    # Send to Arduino (send the finger count)
-                    send_serial_data(ser, str(stable_gesture))
-                    
-                    last_action_time[appliance] = now
+            # Check if this is a NEW gesture (different from last one)
+            if stable_gesture != last_executed_gesture:
+                appliance = GESTURE_MAP[stable_gesture]
+                now = time.time()
+                
+                # Special case: 5 fingers turns off everything
+                if stable_gesture == 5:
+                    if now - last_action_time["ALL_OFF"] > GESTURE_COOLDOWN_S:
+                        for app_name in appliance_state.keys():
+                            appliance_state[app_name] = False
+                        print(f"[ACTION] {stable_name} turned OFF all appliances (5 fingers)")
+                        
+                        send_serial_data(ser, "5")
+                        
+                        last_action_time["ALL_OFF"] = now
+                        last_executed_gesture = stable_gesture  # NEW: Remember this gesture
+                else:
+                    # Normal toggle for individual appliances
+                    if now - last_action_time[appliance] > GESTURE_COOLDOWN_S:
+                        appliance_state[appliance] = not appliance_state[appliance]
+                        state_str = "ON" if appliance_state[appliance] else "OFF"
+                        print(f"[ACTION] {stable_name} triggered {appliance} -> {state_str} (fingers: {stable_gesture})")
+                        
+                        send_serial_data(ser, str(stable_gesture))
+                        
+                        last_action_time[appliance] = now
+                        last_executed_gesture = stable_gesture  # NEW: Remember this gesture
 
         # Draw face rectangles
         for (top, right, bottom, left) in face_locations:
@@ -334,6 +339,11 @@ def main():
         serial_status = "Connected" if (ser and ser.is_open) else "Disconnected"
         overlay = f"Face: {face_label} | Fingers: {finger_label} | Serial: {serial_status}"
         cv2.putText(small, overlay, (10, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+
+        # NEW: Show last executed gesture
+        if last_executed_gesture:
+            cv2.putText(small, f"Last: {last_executed_gesture} fingers", (10, small.shape[0] - 10),
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 0), 2)
 
         legend_y = 50
         for k, v in GESTURE_MAP.items():
@@ -352,7 +362,6 @@ def main():
         if key == ord("q"):
             break
         elif key == ord("r") or key == ord("R"):
-            # Reconnect serial
             print("[SERIAL] Reconnecting...")
             if ser and ser.is_open:
                 ser.close()
@@ -362,7 +371,6 @@ def main():
     cv2.destroyAllWindows()
     mp_h.close()
     
-    # Close serial connection
     if ser and ser.is_open:
         ser.close()
         print("[SERIAL] Connection closed.")
